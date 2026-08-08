@@ -1,242 +1,261 @@
-"""Infrastructure Entropy Engine — Predicts failure from system chaos.
+"""Calibrated entropy-drift detection for infrastructure telemetry.
 
-Genuine Innovation: No one has built this.
-
-Standard approach: Monitor individual metrics → alert on thresholds.
-This approach: Measure the ENTROPY of system behavior over time.
-When entropy increases, the system is becoming more chaotic.
-Predict failure BEFORE any individual metric shows a problem.
-
-Key Insight: A healthy system has predictable behavior (low entropy).
-A failing system becomes unpredictable (high entropy). You can detect
-the transition from order to chaos BEFORE specific symptoms appear.
-
-How it works:
-1. Collect system metrics over time windows
-2. Compute Shannon entropy of metric distributions
-3. Track entropy trends across the system
-4. When entropy exceeds baseline + threshold, predict failure
-5. Identify which metrics are contributing most to entropy increase
-
-This catches failures that threshold monitoring misses because:
-- Each metric is within normal range
-- But the PATTERN of metrics is becoming chaotic
-- The system is about to fail, but no single alarm is triggered
-
-Real-world scenario:
-- GPU 0-7 all reporting normal temperatures
-- GPU 0-7 all reporting normal utilization
-- But the CORRELATION between metrics is breaking down
-- Entropy Engine sees: "System entropy increased 40% in last hour"
-- Prediction: "Cluster failure likely within 2 hours"
-- Action: Proactive migration before failure occurs
+This private GlacierEQ R&D prototype measures changes in metric-distribution
+entropy relative to an explicit calibration baseline. It emits drift signals,
+not failure predictions. No novelty priority, production deployment, failure
+forecast accuracy, or downtime reduction is claimed.
 """
 
+from __future__ import annotations
+
+import json
 import math
 import time
-import json
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional
-from collections import defaultdict
+from dataclasses import dataclass
+from typing import Optional
 
 
-@dataclass
+@dataclass(slots=True)
 class MetricWindow:
-    values: List[float]
-    timestamps: List[float]
     metric_name: str
+    values: list[float]
+    timestamps: list[float]
 
     @property
     def entropy(self) -> float:
         if len(self.values) < 2:
             return 0.0
-
-        min_val = min(self.values)
-        max_val = max(self.values)
-        range_val = max_val - min_val
-
-        if range_val < 1e-10:
+        minimum = min(self.values)
+        maximum = max(self.values)
+        span = maximum - minimum
+        if span <= 1e-12:
             return 0.0
 
-        num_bins = min(32, len(self.values))
-        bins = [0] * num_bins
-        for v in self.values:
-            bin_idx = min(int((v - min_val) / range_val * num_bins), num_bins - 1)
-            bins[bin_idx] += 1
+        bin_count = min(32, max(2, int(math.sqrt(len(self.values)))))
+        bins = [0] * bin_count
+        for value in self.values:
+            index = min(
+                int((value - minimum) / span * bin_count),
+                bin_count - 1,
+            )
+            bins[index] += 1
 
-        n = len(self.values)
-        entropy = 0.0
-        for count in bins:
-            if count > 0:
-                p = count / n
-                entropy -= p * math.log2(p)
+        sample_count = len(self.values)
+        return -sum(
+            (count / sample_count) * math.log2(count / sample_count)
+            for count in bins
+            if count
+        )
 
-        return entropy
 
-    @property
-    def mean(self) -> float:
-        return sum(self.values) / len(self.values) if self.values else 0.0
+@dataclass(frozen=True, slots=True)
+class EntropyBaseline:
+    metric_name: str
+    entropy: float
+    sample_count: int
+    calibrated_at: float
 
-    @property
-    def std(self) -> float:
-        if len(self.values) < 2:
-            return 0.0
-        m = self.mean
-        return math.sqrt(sum((x - m) ** 2 for x in self.values) / len(self.values))
+
+@dataclass(frozen=True, slots=True)
+class EntropyDriftSignal:
+    metric_name: str
+    current_entropy: float
+    baseline_entropy: float
+    absolute_change: float
+    relative_change: Optional[float]
+    direction: str
+    severity: str
 
 
 class EntropyAnalyzer:
-    """Analyzes entropy of metric distributions over time."""
-
-    def __init__(self, window_size: int = 100):
+    def __init__(
+        self,
+        *,
+        window_size: int = 100,
+        minimum_calibration_samples: int = 30,
+        relative_threshold: float = 0.30,
+        absolute_threshold: float = 0.50,
+    ) -> None:
+        if window_size < minimum_calibration_samples:
+            raise ValueError("window_size must cover calibration samples")
+        if minimum_calibration_samples < 2:
+            raise ValueError("minimum_calibration_samples must be at least 2")
+        if relative_threshold <= 0 or absolute_threshold <= 0:
+            raise ValueError("drift thresholds must be positive")
         self.window_size = window_size
-        self.windows: Dict[str, MetricWindow] = {}
-        self.baselines: Dict[str, float] = {}
+        self.minimum_calibration_samples = minimum_calibration_samples
+        self.relative_threshold = relative_threshold
+        self.absolute_threshold = absolute_threshold
+        self.windows: dict[str, MetricWindow] = {}
+        self.baselines: dict[str, EntropyBaseline] = {}
 
-    def ingest(self, metric_name: str, value: float, timestamp: float = 0):
-        if timestamp == 0:
-            timestamp = time.time()
-
-        if metric_name not in self.windows:
-            self.windows[metric_name] = MetricWindow([], [], metric_name)
-
-        window = self.windows[metric_name]
+    def ingest(
+        self,
+        metric_name: str,
+        value: float,
+        *,
+        timestamp: float | None = None,
+    ) -> None:
+        if not metric_name:
+            raise ValueError("metric_name is required")
+        observed_at = time.time() if timestamp is None else timestamp
+        window = self.windows.setdefault(
+            metric_name,
+            MetricWindow(metric_name, [], []),
+        )
         window.values.append(value)
-        window.timestamps.append(timestamp)
-
+        window.timestamps.append(observed_at)
         if len(window.values) > self.window_size:
-            window.values = window.values[-self.window_size:]
-            window.timestamps = window.timestamps[-self.window_size:]
+            overflow = len(window.values) - self.window_size
+            del window.values[:overflow]
+            del window.timestamps[:overflow]
 
-    def compute_entropy(self, metric_name: str) -> float:
+    def calibrate(
+        self,
+        metric_name: str,
+        *,
+        calibrated_at: float | None = None,
+    ) -> EntropyBaseline:
         window = self.windows.get(metric_name)
-        if not window:
-            return 0.0
-        return window.entropy
+        if window is None or len(window.values) < self.minimum_calibration_samples:
+            raise ValueError(
+                f"{metric_name}: insufficient samples for calibration"
+            )
+        baseline = EntropyBaseline(
+            metric_name=metric_name,
+            entropy=window.entropy,
+            sample_count=len(window.values),
+            calibrated_at=(
+                time.time() if calibrated_at is None else calibrated_at
+            ),
+        )
+        self.baselines[metric_name] = baseline
+        return baseline
 
     def compute_system_entropy(self) -> float:
-        entropies = [self.compute_entropy(name) for name in self.windows]
+        entropies = [window.entropy for window in self.windows.values()]
         if not entropies:
             return 0.0
         return sum(entropies) / len(entropies)
 
-    def update_baselines(self):
-        for name, window in self.windows.items():
-            if len(window.values) >= 50:
-                self.baselines[name] = window.entropy
-
-    def detect_entropy_anomaly(self, metric_name: str) -> Optional[dict]:
-        current_entropy = self.compute_entropy(metric_name)
-        baseline = self.baselines.get(metric_name, current_entropy)
-
-        if baseline <= 0:
+    def detect_drift(self, metric_name: str) -> Optional[EntropyDriftSignal]:
+        window = self.windows.get(metric_name)
+        baseline = self.baselines.get(metric_name)
+        if window is None or baseline is None:
             return None
 
-        deviation = (current_entropy - baseline) / baseline
+        current = window.entropy
+        absolute_change = current - baseline.entropy
+        if baseline.entropy > 1e-12:
+            relative_change: float | None = absolute_change / baseline.entropy
+            triggered = abs(relative_change) >= self.relative_threshold
+        else:
+            relative_change = None
+            triggered = abs(absolute_change) >= self.absolute_threshold
+        if not triggered:
+            return None
 
-        if abs(deviation) > 0.3:
-            return {
-                "metric": metric_name,
-                "current_entropy": current_entropy,
-                "baseline_entropy": baseline,
-                "deviation": deviation,
-                "direction": "increasing" if deviation > 0 else "decreasing",
-            }
-
-        return None
+        magnitude = (
+            abs(relative_change)
+            if relative_change is not None
+            else abs(absolute_change) / self.absolute_threshold
+        )
+        severity = "HIGH" if magnitude >= 1.0 else "ELEVATED"
+        return EntropyDriftSignal(
+            metric_name=metric_name,
+            current_entropy=round(current, 6),
+            baseline_entropy=round(baseline.entropy, 6),
+            absolute_change=round(absolute_change, 6),
+            relative_change=(
+                round(relative_change, 6)
+                if relative_change is not None
+                else None
+            ),
+            direction="increasing" if absolute_change > 0 else "decreasing",
+            severity=severity,
+        )
 
 
 class EntropyEngine:
-    """Predicts system failure from entropy analysis.
+    def __init__(self, analyzer: EntropyAnalyzer | None = None) -> None:
+        self.analyzer = analyzer or EntropyAnalyzer()
+        self._analysis_history: list[dict[str, object]] = []
 
-    Innovation: Catches failures that threshold monitoring misses.
-    The system is about to fail, but no single alarm is triggered.
+    def ingest_metric(
+        self,
+        metric_name: str,
+        value: float,
+        *,
+        timestamp: float | None = None,
+    ) -> None:
+        self.analyzer.ingest(metric_name, value, timestamp=timestamp)
 
-    This is the difference between:
-    - Threshold monitoring: "Is this metric out of bounds?" (one-shot)
-    - Entropy prediction: "Is the system becoming chaotic?" (trend)
+    def calibrate_all(self, *, calibrated_at: float | None = None) -> None:
+        for metric_name in sorted(self.analyzer.windows):
+            self.analyzer.calibrate(
+                metric_name,
+                calibrated_at=calibrated_at,
+            )
 
-    Real-world impact: Proactive migration before failure.
-    Saves hours of downtime that threshold monitoring would miss.
-    """
-
-    def __init__(self, entropy_threshold: float = 0.3):
-        self.entropy_threshold = entropy_threshold
-        self.analyzer = EntropyAnalyzer()
-        self._entropy_history: List[dict] = []
-        self._prediction_log: List[dict] = []
-
-    def ingest_metric(self, metric_name: str, value: float):
-        self.analyzer.ingest(metric_name, value)
-
-    def analyze(self) -> dict:
-        system_entropy = self.analyzer.compute_system_entropy()
-
-        anomalies = []
-        for name in self.analyzer.windows:
-            anomaly = self.analyzer.detect_entropy_anomaly(name)
-            if anomaly:
-                anomalies.append(anomaly)
-
-        self._entropy_history.append({
-            "system_entropy": system_entropy,
-            "anomalies": len(anomalies),
-            "timestamp": time.time(),
-        })
-
-        if len(self._entropy_history) > 200:
-            self._entropy_history = self._entropy_history[-200:]
-
-        prediction = None
-        if len(self._entropy_history) >= 10:
-            recent = self._entropy_history[-10:]
-            older = self._entropy_history[-20:-10] if len(self._entropy_history) >= 20 else self._entropy_history[:10]
-
-            recent_entropy = sum(h["system_entropy"] for h in recent) / len(recent)
-            older_entropy = sum(h["system_entropy"] for h in older) / len(older)
-
-            if older_entropy > 0:
-                trend = (recent_entropy - older_entropy) / older_entropy
-                if trend > 0.2:
-                    prediction = {
-                        "prediction": "FAILURE_LIKELY",
-                        "confidence": min(0.9, trend),
-                        "time_horizon_s": 3600 / max(trend, 0.01),
-                        "entropy_trend": trend,
-                    }
-                    self._prediction_log.append({**prediction, "timestamp": time.time()})
-
-        return {
-            "system_entropy": system_entropy,
-            "anomalies": anomalies,
-            "prediction": prediction,
+    def analyze(self) -> dict[str, object]:
+        signals = [
+            signal
+            for metric_name in sorted(self.analyzer.windows)
+            if (signal := self.analyzer.detect_drift(metric_name)) is not None
+        ]
+        result: dict[str, object] = {
+            "system_entropy": round(
+                self.analyzer.compute_system_entropy(),
+                6,
+            ),
+            "signals": [
+                {
+                    "metric_name": signal.metric_name,
+                    "current_entropy": signal.current_entropy,
+                    "baseline_entropy": signal.baseline_entropy,
+                    "absolute_change": signal.absolute_change,
+                    "relative_change": signal.relative_change,
+                    "direction": signal.direction,
+                    "severity": signal.severity,
+                }
+                for signal in signals
+            ],
             "metrics_tracked": len(self.analyzer.windows),
-        }
-
-    def get_engine_status(self) -> dict:
-        return {
-            "system_entropy": self.analyzer.compute_system_entropy(),
             "baselines_set": len(self.analyzer.baselines),
-            "total_analyses": len(self._entropy_history),
-            "total_predictions": len(self._prediction_log),
-            "recent_predictions": self._prediction_log[-5:],
+            "claim_boundary": "entropy_drift_signal_not_failure_prediction",
+        }
+        self._analysis_history.append(result)
+        if len(self._analysis_history) > 200:
+            self._analysis_history = self._analysis_history[-100:]
+        return result
+
+    def get_engine_status(self) -> dict[str, object]:
+        return {
+            "system_entropy": round(
+                self.analyzer.compute_system_entropy(),
+                6,
+            ),
+            "metrics_tracked": len(self.analyzer.windows),
+            "baselines_set": len(self.analyzer.baselines),
+            "total_analyses": len(self._analysis_history),
+            "claim_boundary": "entropy_drift_signal_not_failure_prediction",
         }
 
 
 if __name__ == "__main__":
-    import random
     engine = EntropyEngine()
-
-    for step in range(200):
-        for metric in ["gpu_util", "gpu_temp", "memory_usage", "network_latency"]:
-            if step > 150 and metric == "gpu_temp":
-                value = random.gauss(75, 10)
-            else:
-                value = random.gauss(70, 2)
-            engine.ingest_metric(metric, value)
-
-        result = engine.analyze()
-        if result["prediction"]:
-            print(f"Step {step}: {result['prediction']}")
-
-    print(json.dumps(engine.get_engine_status(), indent=2))
+    demo_time = 1_000_000.0
+    for index in range(40):
+        engine.ingest_metric(
+            "gpu_temperature",
+            70.0 + (index % 3 - 1) * 0.1,
+            timestamp=demo_time + index,
+        )
+    engine.calibrate_all(calibrated_at=demo_time + 40)
+    for index in range(40, 100):
+        engine.ingest_metric(
+            "gpu_temperature",
+            60.0 + float((index * 17) % 23),
+            timestamp=demo_time + index,
+        )
+    print(json.dumps(engine.analyze(), indent=2))
